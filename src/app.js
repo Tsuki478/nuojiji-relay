@@ -20,8 +20,9 @@ import { runGeneration } from './ai/aiCaller.js';
 import { dispatchPush } from './push/pushSender.js';
 import { getVapidPublicKey } from './push/webPush.js';
 import { makeMessageId, nowMs, extractPushBodies } from './util/ids.js';
+import { TICK_CONFIG_KEY, readTickMinutes, hasEnvTickMinutes, rememberTickMinutes } from './proactive/tickConfig.js';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 
 export function createApp() {
     const app = new Hono();
@@ -118,7 +119,7 @@ export function createApp() {
         //   拿不到这条回复（6h 内）= 数据丢失。
         if (await outbox.seenRequest(requestId)) {
             try {
-                const existing = (await outbox.list(inboxId, 0)).find(it => it && String(it.requestId) === String(requestId));
+                const existing = (await outbox.list(inboxId, 0, { scan: true })).find(it => it && String(it.requestId) === String(requestId));
                 if (existing && !existing.error && existing.content) {
                     return c.json({ accepted: true, requestId, generated: true, replayed: true }, 202);
                 }
@@ -238,8 +239,32 @@ export function createApp() {
         const since = Number(c.req.query('since') || 0);
         if (!inboxId) return c.json({ error: 'inboxId required' }, 400);
         const { outbox } = await getStores(c.env);
-        const items = await outbox.list(inboxId, since);
+        // scan=1 → 额外做 KV 前缀扫描兜底（只在手机启动/回前台时带）；scan=0 → 只走索引，不吃 list 额度；
+        // 不带（旧版手机）→ store 内部节流。
+        const scanQ = c.req.query('scan');
+        const scan = scanQ === '1' ? true : scanQ === '0' ? false : undefined;
+        const items = await outbox.list(inboxId, since, { scan });
         return c.json({ items, now: nowMs() });
+    });
+
+    // ⏱️ 检测间隔设置：App 设置页「云端检查频率」写这里，cron 据此决定几分钟真跑一轮主动检测。
+    //    存在 KV（全局一份，中继是用户自己的后端，只服务自己）。环境变量 PROACTIVE_TICK_MINUTES 优先。
+    app.use('/config', requireSecret);
+    app.get('/config', async (c) => {
+        const { kv } = await getStores(c.env);
+        return c.json({ ok: true, tickMinutes: await readTickMinutes(c.env, kv), envLocked: hasEnvTickMinutes(c.env) });
+    });
+    app.post('/config', async (c) => {
+        let body;
+        try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+        const n = Math.floor(Number(body?.tickMinutes));
+        if (!Number.isFinite(n) || n < 1 || n > 60) return c.json({ error: 'tickMinutes must be 1-60' }, 400);
+        const { kv } = await getStores(c.env);
+        // 💸 没变就不写
+        const prev = await kv.get(TICK_CONFIG_KEY);
+        if (String(prev) !== String(n)) await kv.put(TICK_CONFIG_KEY, String(n));
+        rememberTickMinutes(n);
+        return c.json({ ok: true, tickMinutes: n, envLocked: hasEnvTickMinutes(c.env) });
     });
 
     app.post('/ack', async (c) => {

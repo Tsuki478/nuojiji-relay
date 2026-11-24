@@ -27,9 +27,16 @@ serve({ fetch: app.fetch, port }, (info) => {
     console.log(`    store=${process.env.RELAY_STORE || 'memory'}  vapid=${process.env.VAPID_PUBLIC_KEY ? 'on' : 'off (仅轮询)'}`);
 });
 
+// 微信橋接：恢復進程重啟前已綁定的收訊息迴圈
+import { resumeNodeBridges } from './src/wechat/nodeBridge.js';
+resumeNodeBridges().then((n) => { if (n) console.log(`[wechat] resumed ${n} bridge(s)`); })
+    .catch((e) => console.warn('[wechat] resume failed:', e?.message));
+
 // Phase 2：node-cron 定时主动生成（每分钟 tick，与 Workers cron 对齐）
 import cron from 'node-cron';
 import { runProactiveTick, shouldRunTickNow } from './src/proactive/tick.js';
+import { runMomentsTick } from './src/moments/momentsTick.js';
+import { runJobsTick } from './src/jobs/jobsTick.js';
 
 let _ticking = false;
 cron.schedule('* * * * *', async () => {
@@ -41,6 +48,20 @@ cron.schedule('* * * * *', async () => {
         if (r.fired > 0) console.log(`[proactive] tick: ${r.fired}/${r.pairs} fired`);
     } catch (e) {
         console.error('[proactive] node-cron tick failed:', e?.message);
+    }
+    // 后台朋友圈：同一个检测间隔
+    try {
+        const m = await runMomentsTick({});
+        if (m.posted > 0) console.log(`[moments] tick: ${m.posted} posted`);
+    } catch (e) {
+        console.error('[moments] node-cron tick failed:', e?.message);
+    }
+    // 定时生成任务（每日结算 / 角色离线互聊…）
+    try {
+        const j = await runJobsTick({});
+        if (j.ran > 0) console.log(`[jobs] tick: ${j.ran} ran`);
+    } catch (e) {
+        console.error('[jobs] node-cron tick failed:', e?.message);
     } finally {
         _ticking = false;
     }
